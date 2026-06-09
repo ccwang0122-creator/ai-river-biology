@@ -19,6 +19,7 @@ REF_ZIP = BASE_DIR / "reference_images.zip"
 MODEL_PATH = BASE_DIR / "model" / "reference_features.npz"
 META_PATH = BASE_DIR / "reference_metadata.csv"
 SUMMARY_PATH = BASE_DIR / "label_summary.csv"
+LATIN_PATH = BASE_DIR / "latin_names.csv"
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 
@@ -61,6 +62,66 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
+
+
+# =========================
+# 拉丁名映射
+# =========================
+PHYLUM_LATIN_DEFAULT = {
+    "蓝藻门": "Cyanobacteria (Cyanophyta)",
+    "硅藻门": "Bacillariophyta",
+    "金藻门": "Chrysophyta",
+    "隐藻门": "Cryptophyta",
+    "甲藻门": "Dinophyta (Dinoflagellata)",
+    "裸藻门": "Euglenophyta",
+    "绿藻门": "Chlorophyta",
+}
+
+@st.cache_data(show_spinner=False)
+def load_latin_lookup() -> tuple[dict, dict]:
+    """读取中文类群与拉丁名对应表。
+
+    latin_names.csv 由已命名图片库整理而来；属级标签用 sp. 表示。
+    对含 cf. 或斜杠的条目，建议后续根据正式检索表人工复核。
+    """
+    phylum_map = dict(PHYLUM_LATIN_DEFAULT)
+    taxon_map = {}
+    if LATIN_PATH.exists():
+        try:
+            df = pd.read_csv(LATIN_PATH)
+            for _, row in df.iterrows():
+                p = str(row.get("phylum", "")).strip()
+                pl = str(row.get("phylum_latin", "")).strip()
+                t = str(row.get("taxon", "")).strip()
+                tl = str(row.get("taxon_latin", "")).strip()
+                if p and pl:
+                    phylum_map[p] = pl
+                if t and tl and tl.lower() != "nan":
+                    taxon_map[t] = tl
+        except Exception:
+            pass
+    return phylum_map, taxon_map
+
+
+def ensure_latin_columns(meta: pd.DataFrame) -> pd.DataFrame:
+    meta = meta.copy()
+    phylum_map, taxon_map = load_latin_lookup()
+    if "phylum_latin" not in meta.columns:
+        meta["phylum_latin"] = meta["phylum"].astype(str).map(phylum_map)
+    else:
+        meta["phylum_latin"] = meta["phylum_latin"].fillna("")
+        missing = meta["phylum_latin"].astype(str).str.strip().eq("")
+        meta.loc[missing, "phylum_latin"] = meta.loc[missing, "phylum"].astype(str).map(phylum_map)
+    if "taxon_latin" not in meta.columns:
+        meta["taxon_latin"] = meta["taxon"].astype(str).map(taxon_map)
+    else:
+        meta["taxon_latin"] = meta["taxon_latin"].fillna("")
+        missing = meta["taxon_latin"].astype(str).str.strip().eq("")
+        meta.loc[missing, "taxon_latin"] = meta.loc[missing, "taxon"].astype(str).map(taxon_map)
+    meta["phylum_latin"] = meta["phylum_latin"].fillna("未匹配")
+    meta["taxon_latin"] = meta["taxon_latin"].fillna("未匹配")
+    return meta
 
 # =========================
 # 图像与特征函数
@@ -215,7 +276,7 @@ def extract_feature_from_pil(img: Image.Image) -> np.ndarray:
 # =========================
 @st.cache_data(show_spinner=False)
 def load_builtin_classifier() -> dict:
-    meta = pd.read_csv(META_PATH)
+    meta = ensure_latin_columns(pd.read_csv(META_PATH))
     data = np.load(MODEL_PATH, allow_pickle=True)
 
     # GitHub 网页上传一次最多建议少于 100 个文件。
@@ -235,6 +296,8 @@ def load_builtin_classifier() -> dict:
         "X": data["X"].astype("float32"),
         "labels": data["labels"].astype(str),
         "phyla": data["phyla"].astype(str),
+        "latin_names": meta["taxon_latin"].astype(str).to_numpy(),
+        "phylum_latin": meta["phylum_latin"].astype(str).to_numpy(),
         "filenames": data["filenames"].astype(str),
         "ids": data["ids"].astype(str),
         "meta": meta,
@@ -278,12 +341,14 @@ def classifier_from_zip(uploaded_zip) -> dict:
             })
     if not rows:
         raise ValueError("没有在 ZIP 中读取到可用图片。请按 属名/图片.jpg 或 门类/属名/图片.jpg 的结构整理。")
-    meta = pd.DataFrame(rows)
+    meta = ensure_latin_columns(pd.DataFrame(rows))
     return {
         "source": "上传ZIP训练库",
         "X": np.vstack(feats).astype("float32"),
         "labels": meta["taxon"].astype(str).to_numpy(),
         "phyla": meta["phylum"].astype(str).to_numpy(),
+        "latin_names": meta["taxon_latin"].astype(str).to_numpy(),
+        "phylum_latin": meta["phylum_latin"].astype(str).to_numpy(),
         "filenames": meta["filename"].astype(str).to_numpy(),
         "ids": meta["id"].astype(str).to_numpy(),
         "meta": meta,
@@ -316,16 +381,22 @@ def classify_image(img: Image.Image, clf: dict, top_m: int = 30) -> dict:
     top_idx = order[: min(top_m, len(order))]
     agg = defaultdict(list)
     phylum_votes = defaultdict(list)
+    latin_votes = defaultdict(list)
+    phylum_latin_votes = defaultdict(list)
     for idx in top_idx:
         label = str(clf["labels"][idx])
         agg[label].append(float(sims[idx]))
         phylum_votes[label].append(str(clf["phyla"][idx]))
+        latin_votes[label].append(str(clf.get("latin_names", [""] * len(clf["labels"]))[idx]))
+        phylum_latin_votes[label].append(str(clf.get("phylum_latin", [""] * len(clf["labels"]))[idx]))
     rows = []
     for label, vals in agg.items():
         vals_arr = np.array(vals)
         score = 0.65 * vals_arr.max() + 0.35 * vals_arr.mean()
         phylum = pd.Series(phylum_votes[label]).mode().iloc[0]
-        rows.append({"预测属名/类群": label, "门类": phylum, "相似度得分": float(score), "近邻样本数": len(vals)})
+        taxon_latin = pd.Series(latin_votes[label]).mode().iloc[0] if latin_votes[label] else ""
+        phylum_latin = pd.Series(phylum_latin_votes[label]).mode().iloc[0] if phylum_latin_votes[label] else ""
+        rows.append({"预测属名/类群": label, "拉丁名": taxon_latin, "门类": phylum, "门类拉丁名": phylum_latin, "相似度得分": float(score), "近邻样本数": len(vals)})
     cand = pd.DataFrame(rows).sort_values("相似度得分", ascending=False).reset_index(drop=True)
     top5 = cand.head(5).copy()
     denom = float(top5["相似度得分"].clip(lower=0).sum()) + 1e-8
@@ -344,7 +415,9 @@ def classify_uploaded_file(file, clf: dict, sensitivity: float) -> dict:
     return {
         "文件名": getattr(file, "name", "uploaded_image"),
         "预测属名/类群": pred["预测属名/类群"],
+        "拉丁名": pred.get("拉丁名", ""),
         "门类": pred["门类"],
+        "门类拉丁名": pred.get("门类拉丁名", ""),
         "相对置信度(%)": round(float(pred["相对置信度"]), 1),
         "前景个体数估算": int(count),
         "候选结果": result["candidates"],
@@ -388,7 +461,7 @@ st.sidebar.caption("灵敏度越高，检出的前景越多；该计数仅用于
 
 clf = get_active_classifier()
 meta = clf["meta"]
-st.sidebar.success(f"当前模型：{clf['source']}\n\n训练图像：{len(meta)} 张；标签：{meta['taxon'].nunique()} 个")
+st.sidebar.success(f"当前模型：{clf['source']}\n\n训练图像：{len(meta)} 张；标签：{meta['taxon'].nunique()} 个；拉丁名：{meta['taxon_latin'].nunique() if 'taxon_latin' in meta.columns else 0} 个")
 
 # =========================
 # 页面
@@ -404,11 +477,12 @@ if page == "首页":
         """,
         unsafe_allow_html=True,
     )
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("训练图像", f"{len(meta)} 张")
     c2.metric("识别标签", f"{meta['taxon'].nunique()} 个")
-    c3.metric("覆盖门类", f"{meta['phylum'].nunique()} 个")
-    c4.metric("算法", "特征相似度分类")
+    c3.metric("拉丁名", "已加入")
+    c4.metric("覆盖门类", f"{meta['phylum'].nunique()} 个")
+    c5.metric("算法", "特征相似度分类")
 
     st.subheader("这个网站能做什么")
     st.write(
@@ -416,7 +490,7 @@ if page == "首页":
     )
     st.markdown(
         """
-        1. 上传单张显微图片，输出预测属名/类群、门类和相对置信度；  
+        1. 上传单张显微图片，输出预测中文属名/类群、拉丁名、门类和相对置信度；  
         2. 显示 Top 5 候选结果和相似参考图片，方便人工复核；  
         3. 对批量图片进行自动识别，生成群落组成统计；  
         4. 导出 CSV/TXT 结果，用于作业提交和展示；  
@@ -453,14 +527,18 @@ elif page == "单张图像识别":
         try:
             res = classify_uploaded_file(uploaded, clf, sensitivity)
             pred_taxon = res["预测属名/类群"]
+            pred_latin = res.get("拉丁名", "")
             pred_phylum = res["门类"]
+            pred_phylum_latin = res.get("门类拉丁名", "")
             conf = res["相对置信度(%)"]
             count = res["前景个体数估算"]
-            m1, m2, m3, m4 = st.columns(4)
+            m1, m2, m3, m4, m5 = st.columns(5)
             m1.metric("预测属名/类群", pred_taxon)
-            m2.metric("门类", pred_phylum)
-            m3.metric("相对置信度", f"{conf}%")
-            m4.metric("个体数估算", count)
+            m2.metric("拉丁名", pred_latin)
+            m3.metric("门类", pred_phylum)
+            m4.metric("相对置信度", f"{conf}%")
+            m5.metric("个体数估算", count)
+            st.caption(f"门类拉丁名：{pred_phylum_latin}")
 
             if conf < 35:
                 st.warning("相对置信度较低，建议人工复核，或补充该类群的训练图片。")
@@ -481,7 +559,7 @@ elif page == "单张图像识别":
             cols = st.columns(4)
             for j, idx in enumerate(res["相似样本索引"][:8]):
                 rimg = get_reference_image(clf, int(idx))
-                cap = f"{clf['labels'][idx]}｜{clf['phyla'][idx]}"
+                cap = f"{clf['labels'][idx]}｜{clf.get('latin_names', [''] * len(clf['labels']))[idx]}｜{clf['phyla'][idx]}"
                 cols[j % 4].image(rimg, caption=cap, use_container_width=True)
 
             report = pd.DataFrame([{k: v for k, v in res.items() if k not in ["候选结果", "相似样本索引", "图像", "mask", "components"]}])
@@ -491,7 +569,9 @@ elif page == "单张图像识别":
                 f"淡水浮游植物图像识别报告\n"
                 f"文件名：{res['文件名']}\n"
                 f"预测属名/类群：{pred_taxon}\n"
+                f"拉丁名：{pred_latin}\n"
                 f"门类：{pred_phylum}\n"
+                f"门类拉丁名：{pred_phylum_latin}\n"
                 f"相对置信度：{conf}%\n"
                 f"前景个体数估算：{count}\n"
                 f"说明：该结果由课程原型模型自动生成，应结合显微形态特征进行人工复核。\n"
@@ -526,7 +606,7 @@ elif page == "批量图像识别":
                 st.write("按门类统计")
                 phylum_count = df["门类"].value_counts().rename_axis("门类").reset_index(name="数量")
                 st.dataframe(phylum_count, hide_index=True, use_container_width=True)
-                st.bar_chart(phylum_count.set_index("门类"))
+                st.bar_chart(phylum_count.set_index("门类")["图片数"])
             with c2:
                 st.write("按属名/类群统计")
                 taxon_count = df["预测属名/类群"].value_counts().rename_axis("属名/类群").reset_index(name="数量")
@@ -573,20 +653,21 @@ elif page == "上传/切换训练库":
 elif page == "训练库概览":
     st.title("训练库概览")
     st.write(f"当前训练库来源：**{clf['source']}**")
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     c1.metric("训练图片", len(meta))
     c2.metric("标签数量", meta["taxon"].nunique())
-    c3.metric("门类数量", meta["phylum"].nunique())
+    c3.metric("拉丁名数量", meta["taxon_latin"].nunique() if "taxon_latin" in meta.columns else 0)
+    c4.metric("门类数量", meta["phylum"].nunique())
 
     st.subheader("按门类统计")
-    phylum_count = meta["phylum"].value_counts().rename_axis("门类").reset_index(name="图片数")
+    phylum_count = meta.groupby(["phylum", "phylum_latin"]).size().reset_index(name="图片数").rename(columns={"phylum":"门类", "phylum_latin":"门类拉丁名"})
     st.dataframe(phylum_count, hide_index=True, use_container_width=True)
-    st.bar_chart(phylum_count.set_index("门类"))
+    st.bar_chart(phylum_count.set_index("门类")["图片数"])
 
     st.subheader("按属名/类群统计（前30个）")
-    taxon_count = meta["taxon"].value_counts().rename_axis("属名/类群").reset_index(name="图片数")
+    taxon_count = meta.groupby(["taxon", "taxon_latin"]).size().reset_index(name="图片数").rename(columns={"taxon":"属名/类群", "taxon_latin":"拉丁名"}).sort_values("图片数", ascending=False)
     st.dataframe(taxon_count.head(30), hide_index=True, use_container_width=True)
-    st.bar_chart(taxon_count.set_index("属名/类群").head(30))
+    st.bar_chart(taxon_count.set_index("属名/类群")["图片数"].head(30))
 
     st.subheader("浏览参考图片")
     labels = meta["taxon"].value_counts().index.tolist()
@@ -596,7 +677,7 @@ elif page == "训练库概览":
     for j, (idx, r) in enumerate(subset.iterrows()):
         # meta index 与内置 npz 顺序一致；自定义也一致
         img = get_reference_image(clf, int(idx))
-        cols[j % 4].image(img, caption=f"{r['taxon']}｜{r['phylum']}", use_container_width=True)
+        cols[j % 4].image(img, caption=f"{r['taxon']}｜{r.get('taxon_latin', '')}｜{r['phylum']}", use_container_width=True)
 
 elif page == "方法与局限":
     st.title("方法与局限")
@@ -605,7 +686,7 @@ elif page == "方法与局限":
         """
         本 App 采用轻量化的课程原型流程：
 
-        **显微图像输入 → 图像标准化 → 颜色/灰度/纹理/边缘/前景形态特征提取 → 与训练库图片相似度匹配 → Top 候选属名 → 批量统计与报告导出。**
+        **显微图像输入 → 图像标准化 → 颜色/灰度/纹理/边缘/前景形态特征提取 → 与训练库图片相似度匹配 → Top 候选中文属名/拉丁名 → 批量统计与报告导出。**
 
         它不是大型深度学习模型，也不是严格的形态分类检索表。优点是部署轻、可解释、可直接用你提供的“图片—属名”材料训练；缺点是对拍摄条件、背景颜色、比例尺、焦平面和同属内部形态差异比较敏感。
         """
@@ -618,7 +699,7 @@ elif page == "方法与局限":
     st.markdown(
         f"""
         - 内置训练库图像数：**{len(load_builtin_classifier()['meta'])} 张**；  
-        - 覆盖标签数：**{load_builtin_classifier()['meta']['taxon'].nunique()} 个属名/类群**；  
+        - 覆盖标签数：**{load_builtin_classifier()['meta']['taxon'].nunique()} 个属名/类群**，并加入对应拉丁名；  
         - 覆盖门类：蓝藻门、硅藻门、金藻门、隐藻门、甲藻门、裸藻门、绿藻门；  
         - 更适合做课程展示和原型验证，不建议作为正式鉴定结论直接使用。
         """
@@ -626,6 +707,6 @@ elif page == "方法与局限":
     st.subheader("展示时可以这样说")
     st.markdown(
         """
-        > 本网站基于已命名淡水浮游植物显微图片构建参考训练库，覆盖多个淡水浮游植物门类和常见属名。用户上传显微图片后，系统提取颜色、纹理、边缘和形态特征，与训练库进行相似度匹配，输出最可能的属名/类群、门类、置信度和群落组成统计。该系统适合用于 AI River Biology 中的 bioimaging 和 target identification 场景，并可通过继续补充标注图片提高识别能力。
+        > 本网站基于已命名淡水浮游植物显微图片构建参考训练库，覆盖多个淡水浮游植物门类和常见属名。用户上传显微图片后，系统提取颜色、纹理、边缘和形态特征，与训练库进行相似度匹配，输出最可能的中文属名/类群、拉丁名、门类、置信度和群落组成统计。该系统适合用于 AI River Biology 中的 bioimaging 和 target identification 场景，并可通过继续补充标注图片提高识别能力。
         """
     )
