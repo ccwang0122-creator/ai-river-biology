@@ -1,43 +1,47 @@
-# Deploy AI River Biology as a public web app
+# 直接部署步骤
 
-This folder is ready for Streamlit Community Cloud. After deployment, users can open a public link and start recognizing fish and benthic macroinvertebrates directly in the browser.
+## 第一步：上传到 GitHub
 
-## Fastest method: Streamlit Community Cloud
+进入你的 GitHub 仓库 `ai-river-biology`，点击：
 
-1. Create a GitHub repository, for example: `ai-river-biology`.
-2. Upload **all files in this folder** to the repository root. Make sure `app.py` is in the root, not inside another nested folder.
-3. Open Streamlit Community Cloud.
-4. Click **Create app** / **New app**.
-5. Select your GitHub repository.
-6. Set **Main file path** to:
+```text
+Add file → Upload files
+```
+
+把本文件夹里的所有文件拖进去，然后点击：
+
+```text
+Commit changes
+```
+
+注意：`app.py` 必须在仓库最外层。
+
+## 第二步：更新 Streamlit App
+
+如果你已经部署过 Streamlit，上传 GitHub 后一般会自动重启。等 1–3 分钟，然后刷新原来的 App 链接。
+
+如果没有自动更新，进入 Streamlit Cloud 后点击：
+
+```text
+Manage app → Reboot app
+```
+
+## 第三步：Main file path
+
+Streamlit 部署时，主文件路径必须是：
 
 ```text
 app.py
 ```
 
-7. Click **Deploy**.
-8. When deployment is finished, Streamlit will generate a public URL. Share that URL with your teacher/classmates.
+## 第四步：测试
 
-## Alternative method: Hugging Face Spaces
+1. 打开 App 首页；
+2. 左侧进入“单张图片识别”；
+3. 上传一张图片；
+4. 点击“开始 YOLOv8 识别”；
+5. 查看检测框、数量汇总和 CSV 下载。
 
-1. Create a new Space.
-2. Choose **SDK: Streamlit**.
-3. Upload all files in this folder to the Space.
-4. The Space will build automatically and provide a public web link.
+## 重要提醒
 
-## Local test before deployment
-
-```bash
-pip install -r requirements.txt
-streamlit run app.py
-```
-
-## Suggested public app title
-
-AI River Biology: Automatic Fish and Benthic Macroinvertebrate Recognition
-
-## Notes for course submission
-
-- The app provides single-image recognition, batch recognition, custom reference-library recognition, taxon library, and downloadable results.
-- The built-in classifier is a transparent prototype based on segmentation, morphology, color and texture features.
-- For a formal monitoring system, the model should be improved using labelled biological images and deep-learning models such as YOLO, Mask R-CNN or Vision Transformer.
+默认 YOLOv8n 模型不是鱼类/底栖动物专用模型。要获得真正识别效果，请上传你们自己训练的 `best.pt`。

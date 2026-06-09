@@ -1,0 +1,23 @@
+# AI River Biology YOLOv8 dataset config
+# 将 path 改成你的数据集根目录；训练前确保 images/labels 按 YOLO 格式组织。
+path: ./datasets/river_biology
+train: images/train
+val: images/val
+test: images/test
+
+names:
+  0: Cyprinidae_fish
+  1: Salmonidae_fish
+  2: Siluridae_fish
+  3: Cobitidae_fish
+  4: Gobiidae_fish
+  5: Centrarchidae_fish
+  6: Percidae_fish
+  7: Ephemeroptera_nymph
+  8: Plecoptera_nymph
+  9: Trichoptera_larva
+  10: Chironomidae_larva
+  11: Oligochaeta
+  12: Gastropoda
+  13: Bivalvia
+  14: Limnoperna_fortunei
