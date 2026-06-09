@@ -1,26 +1,28 @@
-# AI River Biology：YOLOv8 中文版
+# AI River Biology：淡水浮游植物图像识别 App
 
-这是一个面向 **River Dynamics and Integrated River Management** 课程大作业的 AI River Biology 原型 App。系统使用 **Streamlit + Ultralytics YOLOv8** 构建，用于鱼类和底栖动物图像的目标检测、类群识别、个体数量统计和结果报告导出。
+这是一个面向 **River Dynamics and Integrated River Management** 课程大作业的 Streamlit 原型网站，用于淡水浮游植物显微图片的属名/类群识别、门类统计、批量结果导出和训练库展示。
 
-## 1. 重要说明
-
-本项目是真正调用 YOLOv8 的网页推理框架，但**不内置训练好的鱼类/底栖动物专用权重**。
-
-- 默认 `yolov8n.pt`：只用于测试网页上传、检测框、计数和报表流程。
-- 真正识别鱼类/底栖动物：需要使用你们自己标注并训练得到的 `best.pt`。
-- 推荐展示表述：这是一个“基于 YOLOv8 的河流生物识别 App 原型”，后续通过现场标注数据训练专用权重提高精度。
-
-## 2. 功能
+## 1. 功能
 
 - 中文界面；
-- 单张图片 YOLOv8 检测；
-- 批量图片 YOLOv8 检测；
-- 检测框可视化；
-- 类群数量统计；
-- 采样点、河流、日期记录；
-- CSV 和 TXT 报告下载；
-- 自定义 `best.pt` 上传；
-- YOLOv8 数据集配置和训练说明。
+- 单张显微图片识别；
+- 批量图片识别；
+- 输出预测属名/类群、门类、相对置信度；
+- 显示 Top 5 候选结果和相似参考图片；
+- 简单前景分割和个体数估算；
+- 批量结果 CSV 下载；
+- 支持上传自定义训练库 ZIP；
+- 内置参考训练库来自用户提供的已命名浮游植物 PDF。
+
+## 2. 当前内置训练库
+
+内置训练库从 `已命名.pdf` 中提取：
+
+- 训练图像：423 张；
+- 标签数：102 个属名/类群；
+- 覆盖门类：蓝藻门、硅藻门、金藻门、隐藻门、甲藻门、裸藻门、绿藻门。
+
+注意：这是一套课程原型训练库，不是正式科研级鉴定模型。部分类群样本量较少，识别结果需要人工复核。
 
 ## 3. 本地运行
 
@@ -29,69 +31,52 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-## 4. Streamlit Cloud 部署
+## 4. 部署到 Streamlit Cloud
 
-1. 把本文件夹全部上传到 GitHub 仓库根目录；
-2. 打开 Streamlit Cloud；
-3. 选择仓库；
-4. Main file path 填：
+1. 新建 GitHub 仓库；
+2. 把本文件夹内所有内容上传到仓库根目录；
+3. 打开 Streamlit Community Cloud；
+4. Repository 选择你的仓库；
+5. Branch 填 `main`；
+6. Main file path 填：
 
 ```text
 app.py
 ```
 
-5. 点击 Deploy。
+7. 点击 Deploy。
 
-## 5. 使用自定义 YOLOv8 权重
+## 5. 自定义训练库 ZIP 格式
 
-训练完成后，一般会得到：
+推荐格式：
 
 ```text
-runs/detect/train/weights/best.pt
+phytoplankton_dataset.zip
+├── 硅藻门/
+│   ├── 小环藻属/
+│   │   ├── img001.jpg
+│   │   └── img002.jpg
+│   └── 舟形藻属/
+├── 绿藻门/
+│   └── 衣藻属/
+└── 蓝藻门/
+    └── 伪鱼腥藻属/
 ```
 
-有两种使用方式：
+也支持简化格式：
 
-1. 在 App 左侧选择“上传自定义 best.pt”；
-2. 把 `best.pt` 上传到 GitHub 仓库的 `models/best.pt`，然后在 App 中选择“使用仓库内 models/best.pt”。
-
-## 6. 推荐类群
-
-鱼类：
-
-- Cyprinidae fish（鲤科鱼类）
-- Salmonidae fish（鲑科鱼类）
-- Siluridae fish（鲇科鱼类）
-- Cobitidae fish（鳅科鱼类）
-- Gobiidae fish（虾虎鱼科鱼类）
-- Centrarchidae fish（太阳鱼科鱼类）
-- Percidae fish（鲈形目/鲈科近缘淡水鱼类）
-
-底栖动物：
-
-- Ephemeroptera nymph（蜉蝣目稚虫）
-- Plecoptera nymph（襀翅目稚虫）
-- Trichoptera larva（毛翅目幼虫）
-- Chironomidae larva（摇蚊幼虫）
-- Oligochaeta（寡毛类）
-- Gastropoda（腹足类/螺类）
-- Bivalvia（双壳类）
-- Limnoperna fortunei（淡水壳菜/金贻贝）
-
-## 7. 训练命令
-
-准备好 YOLO 格式标注数据后：
-
-```bash
-yolo detect train data=config/river_biology_yolo_data.yaml model=yolov8n.pt epochs=100 imgsz=640 batch=8
+```text
+小环藻属/img001.jpg
+小环藻属/img002.jpg
+舟形藻属/img001.jpg
 ```
 
-或者：
+## 6. 方法说明
 
-```bash
-python scripts/train_yolov8.py
+本 App 不是 YOLOv8 目标检测模型，而是轻量化的显微图像分类/相似检索模型。流程为：
+
+```text
+图像输入 → 标准化 → 颜色/灰度/纹理/边缘/前景形态特征提取 → 训练库相似度匹配 → 属名/门类预测 → 批量统计与报告导出
 ```
 
-## 8. 作业展示话术
-
-This app is a YOLOv8-based AI River Biology prototype for fish and benthic macroinvertebrate recognition. It accepts biological images, detects individual organisms, estimates counts, records sampling information, and exports CSV or text reports for river ecological assessment. The current version provides the full deployment and inference framework. With labelled field images and a custom trained `best.pt` model, it can be upgraded into a practical river bioimage recognition tool.
+如果后续要做 YOLOv8，需要逐个细胞画检测框，并标注每个细胞的属名。

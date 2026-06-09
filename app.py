@@ -1,507 +1,631 @@
-# -*- coding: utf-8 -*-
-"""
-AI River Biology - YOLOv8 中文版
-基于 Streamlit + Ultralytics YOLOv8 的鱼类与底栖动物图像识别网页原型。
-
-重要说明：
-1. 本 App 的推理框架是真正调用 Ultralytics YOLO。
-2. 要实现鱼类/底栖动物的准确识别，需要上传你们自己训练好的 best.pt。
-3. 默认 yolov8n.pt 只用于验证网页、上传、检测框、计数和报表流程，不是鱼类/底栖动物专用模型。
-"""
-
 from __future__ import annotations
 
 import io
-import os
-import tempfile
-import textwrap
-from datetime import date
+import zipfile
 from pathlib import Path
-from typing import Dict, List, Tuple
+from collections import defaultdict
 
-import cv2
 import numpy as np
 import pandas as pd
 import streamlit as st
-from PIL import Image
+from PIL import Image, ImageOps, ImageDraw
 
-try:
-    from ultralytics import YOLO
-except Exception as exc:  # pragma: no cover
-    YOLO = None
-    ULTRALYTICS_IMPORT_ERROR = exc
-else:
-    ULTRALYTICS_IMPORT_ERROR = None
+# =========================
+# 基础路径
+# =========================
+BASE_DIR = Path(__file__).parent
+REF_DIR = BASE_DIR / "reference_images"
+REF_ZIP = BASE_DIR / "reference_images.zip"
+MODEL_PATH = BASE_DIR / "model" / "reference_features.npz"
+META_PATH = BASE_DIR / "reference_metadata.csv"
+SUMMARY_PATH = BASE_DIR / "label_summary.csv"
 
-
-APP_DIR = Path(__file__).resolve().parent
-CLASSES_PATH = APP_DIR / "classes.csv"
-DATA_YAML_PATH = APP_DIR / "config" / "river_biology_yolo_data.yaml"
-REPO_MODEL_PATH = APP_DIR / "models" / "best.pt"
-
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 
 st.set_page_config(
-    page_title="AI River Biology - YOLOv8 中文版",
-    page_icon="🐟",
+    page_title="淡水浮游植物识别 App",
+    page_icon="🧫",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
+# =========================
+# 样式
+# =========================
+st.markdown(
+    """
+    <style>
+    .block-container {padding-top: 2rem; padding-bottom: 2rem;}
+    .hero {
+        padding: 1.4rem 1.6rem; border-radius: 18px;
+        background: linear-gradient(135deg, #eef9f6 0%, #fff9ed 100%);
+        border: 1px solid #d5ebe3;
+        margin-bottom: 1.2rem;
+    }
+    .hero h1 {margin: 0 0 .6rem 0; color:#0b3d4a;}
+    .tag {
+        display:inline-block; padding:.28rem .62rem; border-radius:999px;
+        border:1px solid #b7dcec; background:#f3fbff; color:#075985;
+        font-size:.86rem; margin:.15rem .25rem .15rem 0;
+    }
+    .note {
+        padding: .9rem 1rem; border-radius: 12px; background:#fff8db;
+        border:1px solid #f0dc8a; color:#5c4300;
+    }
+    .okbox {
+        padding: .9rem 1rem; border-radius: 12px; background:#ecfdf3;
+        border:1px solid #b8e7c9; color:#135b2d;
+    }
+    .small {color:#6b7280; font-size:.88rem;}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
-# -----------------------------
-# Basic data and helper functions
-# -----------------------------
-
-@st.cache_data
-def load_class_table() -> pd.DataFrame:
-    if CLASSES_PATH.exists():
-        return pd.read_csv(CLASSES_PATH)
-    return pd.DataFrame(
-        columns=["id", "class_name", "中文名称", "类别", "生态解释"]
-    )
-
-
-CLASS_TABLE = load_class_table()
-CLASS_NAME_TO_CN = dict(zip(CLASS_TABLE["class_name"], CLASS_TABLE["中文名称"])) if not CLASS_TABLE.empty else {}
-CLASS_NAME_TO_NOTE = dict(zip(CLASS_TABLE["class_name"], CLASS_TABLE["生态解释"])) if not CLASS_TABLE.empty else {}
-
-
-def normalize_class_name(name: str) -> str:
-    """Make YOLO class names comparable to our class table."""
-    return str(name).replace(" ", "_").strip()
-
-
-def chinese_label(name: str) -> str:
-    key = normalize_class_name(name)
-    return CLASS_NAME_TO_CN.get(key, str(name))
-
-
-def ecological_note(name: str) -> str:
-    key = normalize_class_name(name)
-    return CLASS_NAME_TO_NOTE.get(
-        key,
-        "该类群暂无内置生态解释。若使用 COCO 演示模型，该结果只能说明检测流程可运行，不能代表真实鱼类或底栖动物识别结论。",
-    )
-
-
-def pil_to_rgb_array(img: Image.Image) -> np.ndarray:
-    return np.array(img.convert("RGB"))
-
-
-def result_to_dataframe(result, image_name: str, site: str, river: str, sample_date: str) -> pd.DataFrame:
-    rows = []
-    names: Dict[int, str] = result.names if hasattr(result, "names") else {}
-    boxes = result.boxes
-    if boxes is None or len(boxes) == 0:
-        return pd.DataFrame(
-            columns=[
-                "image", "river", "site", "date", "class_id", "class_name", "中文名称",
-                "confidence", "x1", "y1", "x2", "y2", "生态解释"
-            ]
-        )
-
-    xyxy = boxes.xyxy.cpu().numpy()
-    conf = boxes.conf.cpu().numpy()
-    cls = boxes.cls.cpu().numpy().astype(int)
-
-    for i, cls_id in enumerate(cls):
-        raw_name = str(names.get(int(cls_id), str(cls_id)))
-        rows.append(
-            {
-                "image": image_name,
-                "river": river,
-                "site": site,
-                "date": sample_date,
-                "class_id": int(cls_id),
-                "class_name": raw_name,
-                "中文名称": chinese_label(raw_name),
-                "confidence": round(float(conf[i]), 4),
-                "x1": round(float(xyxy[i][0]), 2),
-                "y1": round(float(xyxy[i][1]), 2),
-                "x2": round(float(xyxy[i][2]), 2),
-                "y2": round(float(xyxy[i][3]), 2),
-                "生态解释": ecological_note(raw_name),
-            }
-        )
-    return pd.DataFrame(rows)
-
-
-def count_summary(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return pd.DataFrame(columns=["中文名称", "class_name", "count", "mean_confidence"])
-    return (
-        df.groupby(["中文名称", "class_name"], as_index=False)
-        .agg(count=("class_name", "size"), mean_confidence=("confidence", "mean"))
-        .sort_values(["count", "mean_confidence"], ascending=False)
-    )
-
-
-def make_report_text(df: pd.DataFrame, site: str, river: str, sample_date: str, model_name: str) -> str:
-    lines = [
-        "AI River Biology - YOLOv8 识别报告",
-        "=" * 42,
-        f"河流/水体：{river or '未填写'}",
-        f"采样点：{site or '未填写'}",
-        f"采样日期：{sample_date or '未填写'}",
-        f"模型：{model_name}",
-        "",
-    ]
-    if df.empty:
-        lines += ["未检测到目标。建议检查图片清晰度、目标大小、置信度阈值或模型权重。"]
+# =========================
+# 图像与特征函数
+# =========================
+def _to_rgb_pil(uploaded_or_bytes_or_pil) -> Image.Image:
+    if isinstance(uploaded_or_bytes_or_pil, Image.Image):
+        img = uploaded_or_bytes_or_pil
     else:
-        summary = count_summary(df)
-        lines.append("识别汇总：")
-        for _, row in summary.iterrows():
-            lines.append(
-                f"- {row['中文名称']} ({row['class_name']}): "
-                f"{int(row['count'])} 个，平均置信度 {row['mean_confidence']:.2f}"
-            )
-        lines.append("")
-        lines.append("管理解释：")
-        for name in summary["class_name"].tolist():
-            lines.append(f"- {chinese_label(name)}：{ecological_note(name)}")
-    return "\n".join(lines)
+        img = Image.open(uploaded_or_bytes_or_pil)
+    return img.convert("RGB")
 
 
-@st.cache_resource(show_spinner="正在加载 YOLOv8 模型……")
-def load_yolo_model(model_path: str):
-    if YOLO is None:
-        raise RuntimeError(f"无法导入 ultralytics：{ULTRALYTICS_IMPORT_ERROR}")
-    return YOLO(model_path)
-
-
-def get_model_from_sidebar() -> Tuple[str, str, bool]:
-    """Return model path, display name, whether it is default demo model."""
-    st.sidebar.markdown("### 模型设置")
-    model_source = st.sidebar.radio(
-        "模型来源",
-        ["默认 YOLOv8n 演示模型", "上传自定义 best.pt", "使用仓库内 models/best.pt"],
-        index=0,
-        help="鱼类/底栖动物准确识别必须使用你们自己训练好的 best.pt。",
+def pad_image(img: Image.Image, size=(128, 128)) -> Image.Image:
+    img = img.convert("RGB")
+    return ImageOps.pad(
+        img, size, method=Image.Resampling.LANCZOS, color=(245, 245, 245), centering=(0.5, 0.5)
     )
 
-    is_demo = False
-    if model_source == "默认 YOLOv8n 演示模型":
-        # Ultralytics will download the official small COCO pretrained model if not cached.
-        return "yolov8n.pt", "YOLOv8n 官方演示模型（非鱼类/底栖动物专用）", True
 
-    if model_source == "使用仓库内 models/best.pt":
-        if REPO_MODEL_PATH.exists():
-            return str(REPO_MODEL_PATH), "仓库 models/best.pt 自定义模型", False
-        st.sidebar.error("仓库内还没有 models/best.pt，请先上传训练好的权重文件。")
-        return "yolov8n.pt", "YOLOv8n 官方演示模型（临时备用）", True
+def foreground_mask(img: Image.Image, size=(256, 256), sensitivity: float = 0.55) -> np.ndarray:
+    """显微图像的轻量前景掩膜。用于演示计数，不作为严格细胞分割。"""
+    img = ImageOps.pad(img.convert("RGB"), size, method=Image.Resampling.LANCZOS, color=(245, 245, 245))
+    arr = np.asarray(img).astype("float32") / 255.0
+    gray = arr.mean(axis=2)
+    bg = np.median(arr.reshape(-1, 3), axis=0)
+    diff = np.linalg.norm(arr - bg, axis=2)
+    gx = np.diff(gray, axis=1, append=gray[:, -1:])
+    gy = np.diff(gray, axis=0, append=gray[-1:, :])
+    grad = np.sqrt(gx * gx + gy * gy)
+    # sensitivity 越高，阈值越低，检出的前景越多
+    q = 94 - sensitivity * 28
+    thr1 = max(0.035, float(np.percentile(diff, q)))
+    thr2 = max(0.015, float(np.percentile(grad, q)))
+    mask = (diff > thr1) | (grad > thr2)
+    # 简单去边框噪声
+    mask[:3, :] = False
+    mask[-3:, :] = False
+    mask[:, :3] = False
+    mask[:, -3:] = False
+    return mask
 
-    uploaded_model = st.sidebar.file_uploader("上传训练好的 YOLOv8 权重文件（.pt）", type=["pt"])
-    if uploaded_model is not None:
-        temp_dir = Path(tempfile.gettempdir()) / "ai_river_biology_yolov8_models"
-        temp_dir.mkdir(parents=True, exist_ok=True)
-        model_path = temp_dir / uploaded_model.name
-        with open(model_path, "wb") as f:
-            f.write(uploaded_model.getbuffer())
-        return str(model_path), f"上传模型：{uploaded_model.name}", False
 
-    st.sidebar.info("尚未上传 best.pt，暂时使用 YOLOv8n 演示模型。")
-    return "yolov8n.pt", "YOLOv8n 官方演示模型（临时备用）", True
+def connected_components_count(mask: np.ndarray, min_area: int = 20, max_area_ratio: float = 0.45) -> tuple[int, list[tuple[int, int, int, int, int]]]:
+    """纯 numpy/Python 连通域统计，避免 opencv 依赖。返回 count 和 bbox 列表。"""
+    h, w = mask.shape
+    visited = np.zeros_like(mask, dtype=bool)
+    comps = []
+    max_area = int(h * w * max_area_ratio)
+    for y in range(h):
+        xs = np.where(mask[y] & (~visited[y]))[0]
+        for x0 in xs:
+            if visited[y, x0] or not mask[y, x0]:
+                continue
+            stack = [(y, int(x0))]
+            visited[y, x0] = True
+            area = 0
+            minx = maxx = int(x0)
+            miny = maxy = int(y)
+            while stack:
+                cy, cx = stack.pop()
+                area += 1
+                if cx < minx: minx = cx
+                if cx > maxx: maxx = cx
+                if cy < miny: miny = cy
+                if cy > maxy: maxy = cy
+                for ny in (cy - 1, cy, cy + 1):
+                    for nx in (cx - 1, cx, cx + 1):
+                        if ny == cy and nx == cx:
+                            continue
+                        if 0 <= ny < h and 0 <= nx < w and (not visited[ny, nx]) and mask[ny, nx]:
+                            visited[ny, nx] = True
+                            stack.append((ny, nx))
+            if min_area <= area <= max_area:
+                # 过滤细长的比例尺线条和小噪声
+                bw = maxx - minx + 1
+                bh = maxy - miny + 1
+                aspect = max(bw / max(1, bh), bh / max(1, bw))
+                if aspect < 16:
+                    comps.append((minx, miny, maxx, maxy, area))
+    return len(comps), comps
 
 
-def draw_header() -> None:
+def overlay_mask(img: Image.Image, mask: np.ndarray) -> Image.Image:
+    base = ImageOps.pad(img.convert("RGB"), mask.shape[::-1], method=Image.Resampling.LANCZOS, color=(245, 245, 245)).convert("RGBA")
+    overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
+    ov = np.array(overlay)
+    ov[mask] = [255, 80, 80, 95]
+    return Image.alpha_composite(base, Image.fromarray(ov)).convert("RGB")
+
+
+def draw_component_boxes(img: Image.Image, comps: list[tuple[int, int, int, int, int]], size=(256, 256)) -> Image.Image:
+    out = ImageOps.pad(img.convert("RGB"), size, method=Image.Resampling.LANCZOS, color=(245, 245, 245))
+    draw = ImageDraw.Draw(out)
+    for minx, miny, maxx, maxy, _ in comps:
+        draw.rectangle([minx, miny, maxx, maxy], outline=(255, 50, 50), width=2)
+    return out
+
+
+def foreground_features(arr: np.ndarray) -> np.ndarray:
+    gray = arr.mean(axis=2)
+    med = np.median(arr.reshape(-1, 3), axis=0)
+    diff = np.linalg.norm(arr - med, axis=2)
+    thr = max(0.06, float(np.percentile(diff, 84)))
+    mask = diff > thr
+    area = mask.mean()
+    if mask.any():
+        ys, xs = np.where(mask)
+        h = max(1, int(ys.max() - ys.min() + 1))
+        w = max(1, int(xs.max() - xs.min() + 1))
+        aspect = w / h
+        cy = ys.mean() / mask.shape[0]
+        cx = xs.mean() / mask.shape[1]
+    else:
+        aspect = 1.0
+        cx = 0.5
+        cy = 0.5
+    return np.array([area, min(aspect, 10) / 10, cx, cy], dtype=np.float32)
+
+
+def extract_feature_from_pil(img: Image.Image) -> np.ndarray:
+    img = pad_image(img, (128, 128))
+    arr = np.asarray(img).astype("float32") / 255.0
+    gray = arr.mean(axis=2)
+    feats = []
+    for c in range(3):
+        h, _ = np.histogram(arr[:, :, c], bins=16, range=(0, 1), density=True)
+        feats.append(h.astype("float32"))
+    h, _ = np.histogram(gray, bins=24, range=(0, 1), density=True)
+    feats.append(h.astype("float32"))
+    small = Image.fromarray((gray * 255).astype("uint8")).resize((32, 32), Image.Resampling.BILINEAR)
+    sv = np.asarray(small).astype("float32") / 255.0
+    sv = (sv - sv.mean()) / (sv.std() + 1e-6)
+    feats.append(sv.flatten())
+    row = np.interp(np.linspace(0, 127, 32), np.arange(128), gray.mean(axis=1)).astype("float32")
+    col = np.interp(np.linspace(0, 127, 32), np.arange(128), gray.mean(axis=0)).astype("float32")
+    feats += [row, col]
+    gx = np.diff(gray, axis=1, append=gray[:, -1:])
+    gy = np.diff(gray, axis=0, append=gray[-1:, :])
+    mag = np.sqrt(gx * gx + gy * gy)
+    gh, _ = np.histogram(mag, bins=16, range=(0, float(np.percentile(mag, 99) + 1e-6)), density=True)
+    feats.append(gh.astype("float32"))
+    feats.append(np.array([mag.mean(), mag.std(), np.percentile(mag, 90), np.percentile(mag, 99)], dtype="float32"))
+    feats.append(foreground_features(arr))
+    v = np.concatenate(feats).astype("float32")
+    v = np.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0)
+    v = v / (np.linalg.norm(v) + 1e-8)
+    return v
+
+
+# =========================
+# 模型加载与分类
+# =========================
+@st.cache_data(show_spinner=False)
+def load_builtin_classifier() -> dict:
+    meta = pd.read_csv(META_PATH)
+    data = np.load(MODEL_PATH, allow_pickle=True)
+
+    # GitHub 网页上传一次最多建议少于 100 个文件。
+    # 因此紧凑部署版把 400+ 张参考图打包为 reference_images.zip。
+    # 如果仓库里存在 reference_images 文件夹，也兼容直接读取文件夹。
+    image_zip_bytes = None
+    image_dir = REF_DIR if REF_DIR.exists() else None
+    if image_dir is None and REF_ZIP.exists():
+        image_zip_bytes = {}
+        with zipfile.ZipFile(REF_ZIP) as zf:
+            for name in zf.namelist():
+                if not name.endswith("/") and Path(name).suffix.lower() in IMAGE_EXTS:
+                    image_zip_bytes[Path(name).name] = zf.read(name)
+
+    return {
+        "source": "内置PDF训练库",
+        "X": data["X"].astype("float32"),
+        "labels": data["labels"].astype(str),
+        "phyla": data["phyla"].astype(str),
+        "filenames": data["filenames"].astype(str),
+        "ids": data["ids"].astype(str),
+        "meta": meta,
+        "image_dir": image_dir,
+        "image_zip_bytes": image_zip_bytes,
+        "image_bytes": None,
+    }
+
+
+def classifier_from_zip(uploaded_zip) -> dict:
+    rows = []
+    feats = []
+    image_bytes = []
+    with zipfile.ZipFile(uploaded_zip) as zf:
+        names = [n for n in zf.namelist() if not n.endswith("/") and Path(n).suffix.lower() in IMAGE_EXTS]
+        for n in names:
+            parts = Path(n).parts
+            # 支持两种格式：属名/图片.jpg，或 门类/属名/图片.jpg
+            if len(parts) >= 3 and parts[-3].endswith("门"):
+                phylum = parts[-3]
+                taxon = parts[-2]
+            elif len(parts) >= 2:
+                phylum = "自定义训练库"
+                taxon = parts[-2]
+            else:
+                continue
+            raw = zf.read(n)
+            try:
+                img = Image.open(io.BytesIO(raw)).convert("RGB")
+            except Exception:
+                continue
+            feats.append(extract_feature_from_pil(img))
+            image_bytes.append(raw)
+            rows.append({
+                "id": f"custom_{len(rows)+1:04d}",
+                "page": "自定义",
+                "image_index": len(rows) + 1,
+                "phylum": phylum,
+                "taxon": taxon,
+                "filename": n,
+            })
+    if not rows:
+        raise ValueError("没有在 ZIP 中读取到可用图片。请按 属名/图片.jpg 或 门类/属名/图片.jpg 的结构整理。")
+    meta = pd.DataFrame(rows)
+    return {
+        "source": "上传ZIP训练库",
+        "X": np.vstack(feats).astype("float32"),
+        "labels": meta["taxon"].astype(str).to_numpy(),
+        "phyla": meta["phylum"].astype(str).to_numpy(),
+        "filenames": meta["filename"].astype(str).to_numpy(),
+        "ids": meta["id"].astype(str).to_numpy(),
+        "meta": meta,
+        "image_dir": None,
+        "image_bytes": image_bytes,
+    }
+
+
+def get_active_classifier() -> dict:
+    if "custom_classifier" in st.session_state and st.session_state.get("use_custom", False):
+        return st.session_state["custom_classifier"]
+    return load_builtin_classifier()
+
+
+def get_reference_image(clf: dict, idx: int) -> Image.Image:
+    if clf.get("image_bytes") is not None:
+        return Image.open(io.BytesIO(clf["image_bytes"][idx])).convert("RGB")
+    if clf.get("image_zip_bytes") is not None:
+        fname = Path(str(clf["filenames"][idx])).name
+        raw = clf["image_zip_bytes"][fname]
+        return Image.open(io.BytesIO(raw)).convert("RGB")
+    return Image.open(clf["image_dir"] / clf["filenames"][idx]).convert("RGB")
+
+
+def classify_image(img: Image.Image, clf: dict, top_m: int = 30) -> dict:
+    q = extract_feature_from_pil(img)
+    X = clf["X"]
+    sims = X @ q
+    order = np.argsort(-sims)
+    top_idx = order[: min(top_m, len(order))]
+    agg = defaultdict(list)
+    phylum_votes = defaultdict(list)
+    for idx in top_idx:
+        label = str(clf["labels"][idx])
+        agg[label].append(float(sims[idx]))
+        phylum_votes[label].append(str(clf["phyla"][idx]))
+    rows = []
+    for label, vals in agg.items():
+        vals_arr = np.array(vals)
+        score = 0.65 * vals_arr.max() + 0.35 * vals_arr.mean()
+        phylum = pd.Series(phylum_votes[label]).mode().iloc[0]
+        rows.append({"预测属名/类群": label, "门类": phylum, "相似度得分": float(score), "近邻样本数": len(vals)})
+    cand = pd.DataFrame(rows).sort_values("相似度得分", ascending=False).reset_index(drop=True)
+    top5 = cand.head(5).copy()
+    denom = float(top5["相似度得分"].clip(lower=0).sum()) + 1e-8
+    top5["相对置信度"] = (top5["相似度得分"].clip(lower=0) / denom * 100).round(1)
+    pred = top5.iloc[0].to_dict()
+    ref_idx = top_idx[:8]
+    return {"prediction": pred, "candidates": top5, "similar_indices": ref_idx, "all_sims": sims}
+
+
+def classify_uploaded_file(file, clf: dict, sensitivity: float) -> dict:
+    img = _to_rgb_pil(file)
+    result = classify_image(img, clf)
+    mask = foreground_mask(img, sensitivity=sensitivity)
+    count, comps = connected_components_count(mask)
+    pred = result["prediction"]
+    return {
+        "文件名": getattr(file, "name", "uploaded_image"),
+        "预测属名/类群": pred["预测属名/类群"],
+        "门类": pred["门类"],
+        "相对置信度(%)": round(float(pred["相对置信度"]), 1),
+        "前景个体数估算": int(count),
+        "候选结果": result["candidates"],
+        "相似样本索引": result["similar_indices"],
+        "图像": img,
+        "mask": mask,
+        "components": comps,
+    }
+
+
+def download_df_button(df: pd.DataFrame, filename: str, label="下载CSV结果"):
+    st.download_button(
+        label,
+        df.to_csv(index=False).encode("utf-8-sig"),
+        file_name=filename,
+        mime="text/csv",
+    )
+
+
+# =========================
+# 侧边栏
+# =========================
+st.sidebar.title("AI River Biology")
+st.sidebar.caption("淡水浮游植物图像识别")
+page = st.sidebar.radio(
+    "功能导航",
+    ["首页", "单张图像识别", "批量图像识别", "上传/切换训练库", "训练库概览", "方法与局限"],
+)
+
+st.sidebar.divider()
+st.sidebar.subheader("模型设置")
+if "use_custom" not in st.session_state:
+    st.session_state["use_custom"] = False
+if "custom_classifier" in st.session_state:
+    st.session_state["use_custom"] = st.sidebar.toggle("使用上传的自定义训练库", value=st.session_state["use_custom"])
+else:
+    st.sidebar.info("当前使用内置PDF训练库")
+
+sensitivity = st.sidebar.slider("前景分割灵敏度", 0.10, 0.90, 0.55, 0.05)
+st.sidebar.caption("灵敏度越高，检出的前景越多；该计数仅用于课程原型展示。")
+
+clf = get_active_classifier()
+meta = clf["meta"]
+st.sidebar.success(f"当前模型：{clf['source']}\n\n训练图像：{len(meta)} 张；标签：{meta['taxon'].nunique()} 个")
+
+# =========================
+# 页面
+# =========================
+if page == "首页":
     st.markdown(
         """
-        <div style="padding: 1.2rem 1.4rem; border-radius: 18px; background: linear-gradient(120deg, #E8F7F5 0%, #FFF8EA 100%); border: 1px solid #C7E4E0;">
-            <h1 style="margin-bottom: 0.2rem; color:#063B3A;">🐟 AI River Biology：YOLOv8 鱼类与底栖动物识别 App</h1>
-            <p style="font-size: 1.05rem; margin-bottom: 0; color:#244B4A;">
-            上传河流生物图像，自动输出目标检测框、类群识别、数量统计、采样信息和生态解释报告。
-            </p>
+        <div class="hero">
+        <h1>🧫 AI River Biology：淡水浮游植物图像识别 App</h1>
+        <p>上传显微镜下的淡水浮游植物图片，系统自动输出预测属名/类群、门类、相似参考图、前景个体数估算和可下载报告。</p>
         </div>
+        <span class="tag">浮游植物</span><span class="tag">显微图像</span><span class="tag">属名识别</span><span class="tag">群落组成统计</span><span class="tag">CSV报告</span>
         """,
         unsafe_allow_html=True,
     )
-    st.write("")
-
-
-# -----------------------------
-# Sidebar global settings
-# -----------------------------
-
-st.sidebar.title("AI River Biology")
-page = st.sidebar.radio(
-    "功能导航",
-    ["首页", "单张图片识别", "批量图片识别", "模型训练说明", "识别类群库", "方法与限制"],
-)
-
-model_path, model_display_name, using_demo_model = get_model_from_sidebar()
-conf_thres = st.sidebar.slider("置信度阈值", 0.05, 0.95, 0.25, 0.05)
-iou_thres = st.sidebar.slider("NMS IoU 阈值", 0.10, 0.90, 0.45, 0.05)
-imgsz = st.sidebar.select_slider("推理图像尺寸", options=[320, 416, 512, 640, 768, 960], value=640)
-
-if using_demo_model:
-    st.sidebar.warning(
-        "当前是官方 COCO 演示模型，只能测试 YOLOv8 流程。要识别鱼类/底栖动物，请上传自定义 best.pt。"
-    )
-else:
-    st.sidebar.success("当前使用自定义 YOLOv8 权重。")
-
-
-# -----------------------------
-# Pages
-# -----------------------------
-
-if page == "首页":
-    draw_header()
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("算法框架", "YOLOv8")
-    c2.metric("输入", "河流生物图像")
-    c3.metric("输出", "检测框 + 数量")
-    c4.metric("报告", "CSV / TXT")
+    c1.metric("训练图像", f"{len(meta)} 张")
+    c2.metric("识别标签", f"{meta['taxon'].nunique()} 个")
+    c3.metric("覆盖门类", f"{meta['phylum'].nunique()} 个")
+    c4.metric("算法", "特征相似度分类")
 
-    st.markdown("### 这个网站能做什么")
+    st.subheader("这个网站能做什么")
+    st.write(
+        "本 App 面向 AI River Biology 课程大作业，把淡水浮游植物显微图片转换为可展示、可下载的识别结果。"
+    )
     st.markdown(
         """
-        本 App 面向 **AI River Biology** 课程大作业，用于把鱼类和底栖动物图像转换成可展示、可下载的识别结果。核心流程为：
-
-        1. 上传现场采集或实验室拍摄的生物图片；
-        2. 使用 YOLOv8 对图片中的目标进行检测；
-        3. 输出每个目标的类别、置信度和边界框；
-        4. 自动统计不同类群的个体数量；
-        5. 结合采样点、日期和河流名称生成 CSV 和文字报告。
+        1. 上传单张显微图片，输出预测属名/类群、门类和相对置信度；  
+        2. 显示 Top 5 候选结果和相似参考图片，方便人工复核；  
+        3. 对批量图片进行自动识别，生成群落组成统计；  
+        4. 导出 CSV/TXT 结果，用于作业提交和展示；  
+        5. 可上传自己的训练库 ZIP，让模型替换为你们自己的标注数据。
         """
     )
-
-    st.info(
-        "作业展示建议：先展示首页和流程，再用一张鱼类图片、一张底栖动物图片、一组批量图片分别演示检测、计数和结果下载。"
-    )
-
-    st.markdown("### 技术流程")
     st.markdown(
         """
-        **输入图像 → YOLOv8 目标检测 → 边界框提取 → 类群识别 → 个体数量统计 → 生态解释与报告导出**
-        """
+        <div class="note"><b>重要说明：</b>当前版本是课程原型 App，使用你提供的已命名浮游植物图片作为内置训练库。它适合展示“图像 → 属名/门类 → 组成统计 → 报告”的完整流程；如果要做正式科研级鉴定，需要继续补充更多同一放大倍数、同一拍摄条件下的标注图片。</div>
+        """,
+        unsafe_allow_html=True,
     )
+    st.subheader("建议展示顺序")
+    st.markdown("首页流程 → 单张图片识别 → 批量识别 → 训练库概览 → 方法与局限。")
 
-    st.markdown("### 当前模型状态")
-    if using_demo_model:
-        st.warning(
-            "当前加载的是 YOLOv8n 官方演示模型。它不是针对淡水鱼类和底栖动物训练的模型，因此不能把输出当成真实生物识别结果。"
-        )
-    else:
-        st.success(f"当前加载模型：{model_display_name}")
+elif page == "单张图像识别":
+    st.title("单张图像识别")
+    st.write("上传一张淡水浮游植物显微图片，系统会给出最可能的属名/类群和相似参考图。")
+    uploaded = st.file_uploader("上传图片", type=sorted([e.strip('.') for e in IMAGE_EXTS]), accept_multiple_files=False)
 
-elif page == "单张图片识别":
-    draw_header()
-    st.markdown("### 单张图片识别")
+    # 内置测试样本选择
+    with st.expander("没有测试图片？从内置训练库里选一张试试"):
+        sample_row = meta.sample(1, random_state=3).iloc[0]
+        label_options = meta["taxon"].value_counts().head(30).index.tolist()
+        chosen_label = st.selectbox("选择一个常见类群", label_options)
+        example_meta = meta[meta["taxon"] == chosen_label].head(6)
+        cols = st.columns(min(6, len(example_meta)))
+        for col, (idx, r) in zip(cols, example_meta.iterrows()):
+            img = get_reference_image(clf, int(idx))
+            col.image(img, caption=f"{r['taxon']}｜{r['phylum']}", use_container_width=True)
+        st.caption("可以直接右键保存这些示例图，再回到上传框测试；紧凑版参考图存放在 reference_images.zip 中。")
 
-    with st.expander("填写采样信息", expanded=True):
-        col1, col2, col3 = st.columns(3)
-        river = col1.text_input("河流 / 水体名称", value="")
-        site = col2.text_input("采样点", value="")
-        sample_date = col3.date_input("采样日期", value=date.today()).isoformat()
+    if uploaded is not None:
+        try:
+            res = classify_uploaded_file(uploaded, clf, sensitivity)
+            pred_taxon = res["预测属名/类群"]
+            pred_phylum = res["门类"]
+            conf = res["相对置信度(%)"]
+            count = res["前景个体数估算"]
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("预测属名/类群", pred_taxon)
+            m2.metric("门类", pred_phylum)
+            m3.metric("相对置信度", f"{conf}%")
+            m4.metric("个体数估算", count)
 
-    uploaded_image = st.file_uploader(
-        "上传鱼类或底栖动物图片",
-        type=["jpg", "jpeg", "png", "bmp", "webp"],
-        accept_multiple_files=False,
-    )
+            if conf < 35:
+                st.warning("相对置信度较低，建议人工复核，或补充该类群的训练图片。")
+            else:
+                st.success("已完成识别。建议结合相似参考图进行人工复核。")
 
-    if uploaded_image is not None:
-        image = Image.open(uploaded_image).convert("RGB")
-        st.image(image, caption="原始图片", use_container_width=True)
+            c1, c2, c3 = st.columns(3)
+            c1.image(res["图像"], caption="原始上传图片", use_container_width=True)
+            c2.image(overlay_mask(res["图像"], res["mask"]), caption="前景掩膜叠加", use_container_width=True)
+            c3.image(draw_component_boxes(res["图像"], res["components"]), caption="前景连通域估算框", use_container_width=True)
 
-        run_button = st.button("开始 YOLOv8 识别", type="primary")
-        if run_button:
+            st.subheader("Top 5 候选结果")
+            st.dataframe(res["候选结果"], use_container_width=True, hide_index=True)
+            chart_df = res["候选结果"][["预测属名/类群", "相对置信度"]].set_index("预测属名/类群")
+            st.bar_chart(chart_df)
+
+            st.subheader("相似参考图片")
+            cols = st.columns(4)
+            for j, idx in enumerate(res["相似样本索引"][:8]):
+                rimg = get_reference_image(clf, int(idx))
+                cap = f"{clf['labels'][idx]}｜{clf['phyla'][idx]}"
+                cols[j % 4].image(rimg, caption=cap, use_container_width=True)
+
+            report = pd.DataFrame([{k: v for k, v in res.items() if k not in ["候选结果", "相似样本索引", "图像", "mask", "components"]}])
+            st.subheader("结果下载")
+            download_df_button(report, "phytoplankton_single_result.csv")
+            txt = (
+                f"淡水浮游植物图像识别报告\n"
+                f"文件名：{res['文件名']}\n"
+                f"预测属名/类群：{pred_taxon}\n"
+                f"门类：{pred_phylum}\n"
+                f"相对置信度：{conf}%\n"
+                f"前景个体数估算：{count}\n"
+                f"说明：该结果由课程原型模型自动生成，应结合显微形态特征进行人工复核。\n"
+            )
+            st.download_button("下载TXT报告", txt.encode("utf-8-sig"), "phytoplankton_single_report.txt", "text/plain")
+        except Exception as e:
+            st.error(f"识别失败：{e}")
+
+elif page == "批量图像识别":
+    st.title("批量图像识别")
+    st.write("一次上传多张浮游植物显微图片，自动生成属名预测、门类统计和群落组成表。")
+    files = st.file_uploader("上传多张图片", type=sorted([e.strip('.') for e in IMAGE_EXTS]), accept_multiple_files=True)
+    if files:
+        rows = []
+        progress = st.progress(0)
+        for i, f in enumerate(files):
             try:
-                model = load_yolo_model(model_path)
-                with st.spinner("正在进行 YOLOv8 推理……"):
-                    results = model.predict(
-                        source=pil_to_rgb_array(image),
-                        conf=conf_thres,
-                        iou=iou_thres,
-                        imgsz=imgsz,
-                        verbose=False,
-                    )
-                result = results[0]
-                annotated_bgr = result.plot()
-                annotated_rgb = cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB)
-                df = result_to_dataframe(result, uploaded_image.name, site, river, sample_date)
-                summary = count_summary(df)
+                res = classify_uploaded_file(f, clf, sensitivity)
+                rows.append({k: v for k, v in res.items() if k not in ["候选结果", "相似样本索引", "图像", "mask", "components"]})
+            except Exception as e:
+                rows.append({"文件名": getattr(f, "name", "unknown"), "错误": str(e)})
+            progress.progress((i + 1) / len(files))
+        df = pd.DataFrame(rows)
+        st.subheader("批量识别结果")
+        st.dataframe(df, use_container_width=True, hide_index=True)
+        download_df_button(df, "phytoplankton_batch_results.csv")
 
-                st.markdown("### 识别结果")
-                col_a, col_b, col_c = st.columns(3)
-                col_a.metric("检测目标数", int(len(df)))
-                col_b.metric("识别类群数", int(df["class_name"].nunique()) if not df.empty else 0)
-                col_c.metric("模型", model_display_name[:28] + ("..." if len(model_display_name) > 28 else ""))
+        if "预测属名/类群" in df.columns:
+            st.subheader("群落组成统计")
+            c1, c2 = st.columns(2)
+            with c1:
+                st.write("按门类统计")
+                phylum_count = df["门类"].value_counts().rename_axis("门类").reset_index(name="数量")
+                st.dataframe(phylum_count, hide_index=True, use_container_width=True)
+                st.bar_chart(phylum_count.set_index("门类"))
+            with c2:
+                st.write("按属名/类群统计")
+                taxon_count = df["预测属名/类群"].value_counts().rename_axis("属名/类群").reset_index(name="数量")
+                st.dataframe(taxon_count, hide_index=True, use_container_width=True)
+                st.bar_chart(taxon_count.set_index("属名/类群").head(20))
 
-                st.image(annotated_rgb, caption="YOLOv8 检测结果", use_container_width=True)
-
-                if df.empty:
-                    st.warning("未检测到目标。可以降低置信度阈值，或检查图片清晰度、目标大小和模型权重。")
-                else:
-                    st.markdown("#### 数量汇总")
-                    st.dataframe(summary, use_container_width=True)
-                    st.markdown("#### 逐目标检测结果")
-                    st.dataframe(df, use_container_width=True)
-
-                    csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
-                    st.download_button(
-                        "下载 CSV 结果表",
-                        data=csv_bytes,
-                        file_name="ai_river_biology_yolov8_result.csv",
-                        mime="text/csv",
-                    )
-                    report = make_report_text(df, site, river, sample_date, model_display_name)
-                    st.download_button(
-                        "下载 TXT 识别报告",
-                        data=report.encode("utf-8"),
-                        file_name="ai_river_biology_yolov8_report.txt",
-                        mime="text/plain",
-                    )
-            except Exception as exc:
-                st.error("识别失败。请检查模型文件、依赖安装或图片格式。")
-                st.exception(exc)
-    else:
-        st.info("请先上传一张图片。")
-
-elif page == "批量图片识别":
-    draw_header()
-    st.markdown("### 批量图片识别")
-
-    with st.expander("填写统一采样信息", expanded=True):
-        col1, col2, col3 = st.columns(3)
-        river = col1.text_input("河流 / 水体名称", value="")
-        site = col2.text_input("采样点 / 样品批次", value="")
-        sample_date = col3.date_input("采样日期", value=date.today()).isoformat()
-
-    uploaded_images = st.file_uploader(
-        "上传多张图片",
-        type=["jpg", "jpeg", "png", "bmp", "webp"],
-        accept_multiple_files=True,
-    )
-
-    if uploaded_images:
-        st.write(f"已上传 {len(uploaded_images)} 张图片。")
-        if st.button("开始批量识别", type="primary"):
-            all_rows: List[pd.DataFrame] = []
-            preview_cols = st.columns(2)
-            try:
-                model = load_yolo_model(model_path)
-                progress = st.progress(0)
-                for idx, file in enumerate(uploaded_images):
-                    image = Image.open(file).convert("RGB")
-                    results = model.predict(
-                        source=pil_to_rgb_array(image),
-                        conf=conf_thres,
-                        iou=iou_thres,
-                        imgsz=imgsz,
-                        verbose=False,
-                    )
-                    result = results[0]
-                    df_i = result_to_dataframe(result, file.name, site, river, sample_date)
-                    all_rows.append(df_i)
-
-                    if idx < 2:
-                        annotated_bgr = result.plot()
-                        annotated_rgb = cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB)
-                        preview_cols[idx % 2].image(annotated_rgb, caption=f"预览：{file.name}", use_container_width=True)
-                    progress.progress((idx + 1) / len(uploaded_images))
-
-                final_df = pd.concat(all_rows, ignore_index=True) if all_rows else pd.DataFrame()
-                st.markdown("### 批量识别汇总")
-                st.dataframe(count_summary(final_df), use_container_width=True)
-                st.markdown("### 批量逐目标结果")
-                st.dataframe(final_df, use_container_width=True)
-
-                csv_bytes = final_df.to_csv(index=False).encode("utf-8-sig")
-                st.download_button(
-                    "下载批量 CSV 结果",
-                    data=csv_bytes,
-                    file_name="ai_river_biology_yolov8_batch_results.csv",
-                    mime="text/csv",
-                )
-            except Exception as exc:
-                st.error("批量识别失败。")
-                st.exception(exc)
-    else:
-        st.info("请上传两张或更多图片进行批量测试。")
-
-elif page == "模型训练说明":
-    draw_header()
-    st.markdown("### YOLOv8 自定义模型训练说明")
-    st.warning(
-        "真正的鱼类和底栖动物识别，需要用标注好的图片训练自定义 YOLOv8 模型。只下载真实图片但不画检测框，不能训练目标检测模型。"
-    )
-
-    st.markdown("#### 1. 数据集目录结构")
-    st.code(
-        textwrap.dedent(
-            """
-            datasets/river_biology/
-            ├── images/
-            │   ├── train/
-            │   ├── val/
-            │   └── test/
-            └── labels/
-                ├── train/
-                ├── val/
-                └── test/
-            """
-        ).strip(),
-        language="text",
-    )
-
-    st.markdown("#### 2. 标注格式")
-    st.markdown(
-        "每张图片需要一个同名 `.txt` 标注文件，每一行代表一个目标，格式为："
-    )
-    st.code("class_id x_center y_center width height", language="text")
-    st.markdown("其中坐标均为 0–1 之间的归一化数值。可以用 LabelImg、CVAT、Roboflow 等工具标注。")
-
-    st.markdown("#### 3. data.yaml")
-    if DATA_YAML_PATH.exists():
-        yaml_text = DATA_YAML_PATH.read_text(encoding="utf-8")
-        st.code(yaml_text, language="yaml")
-        st.download_button(
-            "下载 river_biology_yolo_data.yaml",
-            data=yaml_text.encode("utf-8"),
-            file_name="river_biology_yolo_data.yaml",
-            mime="text/yaml",
-        )
-
-    st.markdown("#### 4. 训练命令")
-    st.code(
-        "yolo detect train data=config/river_biology_yolo_data.yaml model=yolov8n.pt epochs=100 imgsz=640 batch=8",
-        language="bash",
-    )
-
-    st.markdown("#### 5. 训练完成后怎么用")
-    st.markdown(
-        "训练结束后，通常会得到 `runs/detect/train/weights/best.pt`。把这个文件上传到本 App 左侧的“上传自定义 best.pt”，或者放到 GitHub 仓库的 `models/best.pt`，即可用于在线识别。"
-    )
-
-elif page == "识别类群库":
-    draw_header()
-    st.markdown("### 建议识别类群库")
-    st.dataframe(CLASS_TABLE, use_container_width=True)
-    st.markdown(
-        "这些类群是课程展示中相对稳妥的识别层级：鱼类建议先做到科/类群，底栖动物建议先做到目/科/大类群。样本量足够后再细化到物种。"
-    )
-
-elif page == "方法与限制":
-    draw_header()
-    st.markdown("### 方法与限制")
+elif page == "上传/切换训练库":
+    st.title("上传/切换训练库")
+    st.write("你可以继续使用内置训练库，也可以上传自己的标注图片 ZIP，让 App 按你的图片重新训练。")
     st.markdown(
         """
-        #### 方法
-        - 本 App 使用 Ultralytics YOLOv8 作为目标检测框架；
-        - 输入为鱼类或底栖动物图片；
-        - 输出为检测框、类别、置信度、数量统计和报告；
-        - 支持上传自定义 `best.pt` 权重，因此后续可以替换为真正基于现场数据训练的模型。
+        推荐 ZIP 结构：
+        ```text
+        phytoplankton_dataset.zip
+        ├── 硅藻门/
+        │   ├── 小环藻属/
+        │   │   ├── img001.jpg
+        │   │   └── img002.jpg
+        │   └── 舟形藻属/
+        ├── 绿藻门/
+        │   └── 衣藻属/
+        └── 蓝藻门/
+            └── 伪鱼腥藻属/
+        ```
+        也支持简化结构：`小环藻属/img001.jpg`。
+        """
+    )
+    upzip = st.file_uploader("上传训练库 ZIP", type=["zip"])
+    if upzip is not None:
+        try:
+            with st.spinner("正在读取图片并构建特征库……"):
+                custom = classifier_from_zip(upzip)
+            st.session_state["custom_classifier"] = custom
+            st.session_state["use_custom"] = True
+            st.success(f"自定义训练库已加载：{len(custom['meta'])} 张图片，{custom['meta']['taxon'].nunique()} 个标签。")
+            st.dataframe(custom["meta"].head(20), use_container_width=True, hide_index=True)
+        except Exception as e:
+            st.error(f"训练库读取失败：{e}")
+    st.divider()
+    if st.button("切回内置PDF训练库"):
+        st.session_state["use_custom"] = False
+        st.success("已切回内置PDF训练库。")
 
-        #### 限制
-        - 如果没有自定义训练权重，默认 YOLOv8n 不能准确识别鱼类和底栖动物；
-        - 从网上搜集真实图片只能作为素材来源，仍然需要人工标注检测框；
-        - 复杂背景、水下反光、目标遮挡、显微镜尺度差异都会影响检测效果；
-        - 课程展示中建议明确表述为“YOLOv8 原型系统”，不要夸大为成熟业务系统。
+elif page == "训练库概览":
+    st.title("训练库概览")
+    st.write(f"当前训练库来源：**{clf['source']}**")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("训练图片", len(meta))
+    c2.metric("标签数量", meta["taxon"].nunique())
+    c3.metric("门类数量", meta["phylum"].nunique())
 
-        #### 推荐展示表述
-        本系统构建了一个基于 YOLOv8 的河流生物图像识别 App。它能够完成图片上传、目标检测、数量统计和结果导出。当前版本提供完整的推理和部署框架，后续可通过标注现场采集的鱼类和底栖动物图片训练专用权重，从而提升识别精度和实际应用价值。
+    st.subheader("按门类统计")
+    phylum_count = meta["phylum"].value_counts().rename_axis("门类").reset_index(name="图片数")
+    st.dataframe(phylum_count, hide_index=True, use_container_width=True)
+    st.bar_chart(phylum_count.set_index("门类"))
+
+    st.subheader("按属名/类群统计（前30个）")
+    taxon_count = meta["taxon"].value_counts().rename_axis("属名/类群").reset_index(name="图片数")
+    st.dataframe(taxon_count.head(30), hide_index=True, use_container_width=True)
+    st.bar_chart(taxon_count.set_index("属名/类群").head(30))
+
+    st.subheader("浏览参考图片")
+    labels = meta["taxon"].value_counts().index.tolist()
+    chosen = st.selectbox("选择属名/类群", labels)
+    subset = meta[meta["taxon"] == chosen].head(12)
+    cols = st.columns(4)
+    for j, (idx, r) in enumerate(subset.iterrows()):
+        # meta index 与内置 npz 顺序一致；自定义也一致
+        img = get_reference_image(clf, int(idx))
+        cols[j % 4].image(img, caption=f"{r['taxon']}｜{r['phylum']}", use_container_width=True)
+
+elif page == "方法与局限":
+    st.title("方法与局限")
+    st.subheader("算法流程")
+    st.markdown(
+        """
+        本 App 采用轻量化的课程原型流程：
+
+        **显微图像输入 → 图像标准化 → 颜色/灰度/纹理/边缘/前景形态特征提取 → 与训练库图片相似度匹配 → Top 候选属名 → 批量统计与报告导出。**
+
+        它不是大型深度学习模型，也不是严格的形态分类检索表。优点是部署轻、可解释、可直接用你提供的“图片—属名”材料训练；缺点是对拍摄条件、背景颜色、比例尺、焦平面和同属内部形态差异比较敏感。
+        """
+    )
+    st.subheader("为什么这里不用 YOLOv8")
+    st.write(
+        "浮游植物显微图像如果要用 YOLOv8，需要逐个细胞画检测框，并给每个框标注属名。你现在提供的是已命名图像页，更适合先做图像分类/相似识别。后续如果你愿意逐个细胞标框，可以再升级成 YOLOv8 目标检测版本。"
+    )
+    st.subheader("目前内置库的适用范围")
+    st.markdown(
+        f"""
+        - 内置训练库图像数：**{len(load_builtin_classifier()['meta'])} 张**；  
+        - 覆盖标签数：**{load_builtin_classifier()['meta']['taxon'].nunique()} 个属名/类群**；  
+        - 覆盖门类：蓝藻门、硅藻门、金藻门、隐藻门、甲藻门、裸藻门、绿藻门；  
+        - 更适合做课程展示和原型验证，不建议作为正式鉴定结论直接使用。
+        """
+    )
+    st.subheader("展示时可以这样说")
+    st.markdown(
+        """
+        > 本网站基于已命名淡水浮游植物显微图片构建参考训练库，覆盖多个淡水浮游植物门类和常见属名。用户上传显微图片后，系统提取颜色、纹理、边缘和形态特征，与训练库进行相似度匹配，输出最可能的属名/类群、门类、置信度和群落组成统计。该系统适合用于 AI River Biology 中的 bioimaging 和 target identification 场景，并可通过继续补充标注图片提高识别能力。
         """
     )
