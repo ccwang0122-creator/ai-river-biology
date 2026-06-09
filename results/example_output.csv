@@ -1,0 +1,4 @@
+file,site,date,latitude,longitude,predicted_taxon,category,confidence,detected_count,water_note
+example_fish.jpg,River reach A,2026-06-09,39.9042,116.4074,Cyprinidae fish,Fish,0.82,1,Demo output
+example_mayfly.jpg,River reach A,2026-06-09,39.9042,116.4074,Ephemeroptera nymph,Benthic macroinvertebrate,0.76,1,Demo output
+example_mussel.jpg,River reach A,2026-06-09,39.9042,116.4074,Limnoperna fortunei,Benthic macroinvertebrate,0.71,1,Demo output
